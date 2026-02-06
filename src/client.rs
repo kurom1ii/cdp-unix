@@ -76,8 +76,17 @@ impl CdpClient {
     }
 
     async fn recv_response(&mut self, expected_id: u64) -> Result<DaemonMsg> {
+        self.recv_response_timeout(expected_id, std::time::Duration::from_secs(30)).await
+    }
+
+    async fn recv_response_timeout(
+        &mut self,
+        expected_id: u64,
+        timeout: std::time::Duration,
+    ) -> Result<DaemonMsg> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), self.msg_rx.recv()).await {
+            match tokio::time::timeout_at(deadline, self.msg_rx.recv()).await {
                 Ok(Some(msg)) => {
                     let msg_id = match &msg {
                         DaemonMsg::CdpResponse { id, .. } => Some(*id),
@@ -93,7 +102,7 @@ impl CdpClient {
                     }
                 }
                 Ok(None) => anyhow::bail!("daemon connection closed"),
-                Err(_) => anyhow::bail!("response timeout (30s)"),
+                Err(_) => anyhow::bail!("response timeout ({}s)", timeout.as_secs()),
             }
         }
     }
@@ -150,7 +159,9 @@ impl CdpClient {
     pub async fn warmup(&mut self, count: usize, url: &str) -> Result<usize> {
         let id = self.alloc_id();
         self.send(&ClientMsg::Warmup { id, count, url: url.to_string() }).await?;
-        match self.recv_response(id).await? {
+        // Timeout tính theo số pages: tối thiểu 30s, thêm 200ms mỗi page
+        let timeout_secs = 30 + (count as u64 * 200) / 1000;
+        match self.recv_response_timeout(id, std::time::Duration::from_secs(timeout_secs)).await? {
             DaemonMsg::WarmupDone { count, .. } => Ok(count),
             DaemonMsg::Error { message, .. } => anyhow::bail!("{message}"),
             other => anyhow::bail!("unexpected: {other:?}"),

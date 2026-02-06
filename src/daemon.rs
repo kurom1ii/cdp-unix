@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -123,15 +123,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         let url = config.warmup_url.clone();
 
         tokio::spawn(async move {
-            info!(count, url = %url, "warmup starting");
-            for i in 0..count {
-                match create_warm_page(&chrome_tx, &pending_tx, &id_ctr, &url).await {
-                    Ok(page) => {
-                        let _ = router_tx.send(RouterEvent::WarmPageReady(page));
-                    }
-                    Err(e) => warn!(i, "warmup page failed: {e}"),
-                }
-            }
+            info!(count, url = %url, "warmup starting (concurrent)");
+            spawn_concurrent_warmup(count, &url, &chrome_tx, &pending_tx, &id_ctr, &router_tx, None).await;
             info!("warmup done");
         });
     }
@@ -341,16 +334,7 @@ fn handle_client_msg(
             let rtx = router_tx.clone();
 
             tokio::spawn(async move {
-                let mut created = 0usize;
-                for _ in 0..count {
-                    match create_warm_page(&tx, &ptx, &idc, &url).await {
-                        Ok(page) => {
-                            let _ = rtx.send(RouterEvent::WarmPageReady(page));
-                            created += 1;
-                        }
-                        Err(e) => warn!("warmup failed: {e}"),
-                    }
-                }
+                let created = spawn_concurrent_warmup(count, &url, &tx, &ptx, &idc, &rtx, None).await;
                 if let Some(ctx) = client_tx {
                     let _ = ctx.send(DaemonMsg::WarmupDone { id, count: created });
                 }
@@ -369,6 +353,49 @@ fn handle_client_msg(
             }
         }
     }
+}
+
+/// Warmup N pages đồng thời, giới hạn concurrency (mặc định 20).
+/// Trả về số pages tạo thành công.
+async fn spawn_concurrent_warmup(
+    count: usize,
+    url: &str,
+    chrome_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    pending_tx: &mpsc::UnboundedSender<PendingInternal>,
+    id_counter: &Arc<AtomicU64>,
+    router_tx: &mpsc::UnboundedSender<RouterEvent>,
+    concurrency: Option<usize>,
+) -> usize {
+    let sem = Arc::new(Semaphore::new(concurrency.unwrap_or(20)));
+    let created = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let tx = chrome_tx.clone();
+        let ptx = pending_tx.clone();
+        let idc = id_counter.clone();
+        let rtx = router_tx.clone();
+        let u = url.to_string();
+        let cnt = created.clone();
+
+        handles.push(tokio::spawn(async move {
+            match create_warm_page(&tx, &ptx, &idc, &u).await {
+                Ok(page) => {
+                    let _ = rtx.send(RouterEvent::WarmPageReady(page));
+                    cnt.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => warn!("warmup failed: {e}"),
+            }
+            drop(permit);
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    created.load(Ordering::Relaxed) as usize
 }
 
 fn send_error(clients: &HashMap<u64, ClientState>, client_id: u64, id: u64, msg: &str) {
